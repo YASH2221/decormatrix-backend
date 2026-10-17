@@ -1,0 +1,15 @@
+.env
+.env.*
+!.env.example
+.git
+.gitignore
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+test_*.py
+start_backend.bat
+Dockerfile
+.dockerignore
+render.yaml
+README.md

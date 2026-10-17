@@ -20,9 +20,25 @@ python main.py              # http://localhost:8000
 
 With `SUPABASE_URL` / `SUPABASE_ANON_KEY` unset the endpoint is open (development only).
 
-## Deploy (Render, Railway, Cloud Run…)
+## Docker
 
-- Start command: `uvicorn main:app --host 0.0.0.0 --port $PORT`
+```bash
+docker build -t decormatrix-backend .
+docker run --env-file .env -p 8000:8000 decormatrix-backend
+```
+
+## Deploy on Render (Docker)
+
+1. Render → **New → Blueprint** → pick this repo (`render.yaml` is picked up), or
+   **New → Web Service** → this repo → Language **Docker**, Health check path `/health`.
+2. Fill the secret env vars when asked (below). `PORT` is set by Render.
+3. After the deploy, check `https://<service>.onrender.com/health`.
+
+Free instances sleep after ~15 min idle; the first request after that takes ~30–60 s.
+
+## Deploy (other hosts)
+
+- Docker image as above, or start command: `uvicorn main:app --host 0.0.0.0 --port $PORT`
 - Set `GEMINI_API_KEY`, `SUPABASE_URL`, `SUPABASE_ANON_KEY` (the app's publishable key),
   and `ALLOWED_ORIGINS` to the web app's origin.
 - Point the app at it: `EXPO_PUBLIC_KITCHEN_AI_URL=https://<your-backend>` in `DecorMatrix/.env`,
