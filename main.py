@@ -105,9 +105,41 @@ class KitchenAiResponse(BaseModel):
     summary: str
 
 
+def _supabase_diagnostics() -> Dict[str, Any]:
+    """Explains why the sign-in check can't reach Supabase. Never echoes the key itself."""
+    url = SUPABASE_URL
+    key = SUPABASE_ANON_KEY
+    diag: Dict[str, Any] = {
+        # The project URL is public (it ships in the app bundle); repr() exposes stray quotes/whitespace.
+        "url": repr(url),
+        "url_has_https": url.startswith("https://"),
+        "url_looks_like_supabase": url.endswith(".supabase.co"),
+        "key_kind": (
+            "missing" if not key
+            else "publishable" if key.startswith("sb_publishable_")
+            else "secret (wrong key!)" if key.startswith("sb_secret_")
+            else "legacy jwt" if key.startswith("eyJ")
+            else "unrecognised"
+        ),
+        "key_has_whitespace_or_quotes": key != key.strip().strip("\"'"),
+    }
+    req = urllib.request.Request(f"{url}/auth/v1/settings", headers={"apikey": key})
+    try:
+        with urllib.request.urlopen(req, timeout=8) as res:
+            diag["probe"] = f"ok {res.status}"
+    except urllib.error.HTTPError as e:
+        diag["probe"] = f"http {e.code}: {e.read().decode('utf-8', 'replace')[:200]}"
+    except Exception as e:
+        diag["probe"] = f"unreachable: {e!r}"[:300]
+    return diag
+
+
 @app.get("/health")
-def health():
-    return {"status": "online", "service": "DecorMatrix Kitchen AI", "auth": AUTH_ENABLED}
+def health(check: Optional[str] = None):
+    out: Dict[str, Any] = {"status": "online", "service": "DecorMatrix Kitchen AI", "auth": AUTH_ENABLED}
+    if check == "supabase":
+        out["supabase"] = _supabase_diagnostics()
+    return out
 
 
 @app.post("/api/kitchen/ai", response_model=KitchenAiResponse)
