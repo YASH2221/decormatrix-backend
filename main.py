@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import time
+import urllib.error
 import urllib.request
 from collections import defaultdict, deque
 from typing import Any, Dict, Optional
@@ -59,8 +60,17 @@ def _user_from_token(authorization: Optional[str]) -> str:
     try:
         with urllib.request.urlopen(req, timeout=8) as res:
             user = json.loads(res.read().decode("utf-8"))
-    except Exception:
-        raise HTTPException(status_code=401, detail="Session expired. Please sign in again.")
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", "replace")[:300]
+        log.warning("Supabase token check failed: %s %s", e.code, body)
+        # Supabase answers 403 bad_jwt for an expired/invalid user token; anything else
+        # (e.g. 401 "Invalid API key", 404 wrong URL) is our SUPABASE_* config.
+        if e.code == 403 or "jwt" in body.lower():
+            raise HTTPException(status_code=401, detail="Session expired. Please sign in again.")
+        raise HTTPException(status_code=502, detail="AI server sign-in check is misconfigured")
+    except Exception as e:
+        log.warning("Supabase token check unreachable: %r", e)
+        raise HTTPException(status_code=503, detail="Could not verify your session. Try again shortly.")
     user_id = user.get("id")
     if not user_id:
         raise HTTPException(status_code=401, detail="Invalid session")
