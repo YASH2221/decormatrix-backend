@@ -7,8 +7,12 @@ applies the operations and enforces every fit, overlap and window/door rule.
 ```
 POST /api/kitchen/ai   { "prompt": "...", "plan": { ...compact plan... } }
   -> { "operations": [ { "op": "auto_design", "brief": {...} }, ... ], "summary": "..." }
+POST /api/kitchen/ai/image   { "image": "<base64>", "mimeType": "image/jpeg", "prompt": "optional note", "plan": {...} }
+  -> same response; only moves / restyles of the plan's existing modules (no add, remove or resize)
 GET  /health
 ```
+
+The image endpoint uses `GEMINI_IMAGE_MODELS` (default `gemini-3.5-flash,gemini-3.5-flash-lite`) and `GEMINI_IMAGE_TIMEOUT_SECONDS` (default 40).
 
 ## Run locally
 

@@ -15,6 +15,10 @@ log = logging.getLogger("kitchen_ai")
 MODELS = [m.strip() for m in os.getenv(
     "GEMINI_MODELS", "gemini-3.5-flash-lite,gemini-3.5-flash,gemini-3.1-flash-lite"
 ).split(",") if m.strip()]
+# Photos need the stronger model: flash-lite reads colours but misses windows and walls.
+IMAGE_MODELS = [m.strip() for m in os.getenv(
+    "GEMINI_IMAGE_MODELS", "gemini-3.5-flash,gemini-3.5-flash-lite"
+).split(",") if m.strip()]
 
 OPS = [
     "set_room", "auto_design", "add_module", "update_module", "update_modules", "move_module",
@@ -256,12 +260,38 @@ def _clean(value: Any) -> Any:
     return value
 
 
+# Preset colours (same as DecorMatrix/src/kitchen/catalog.ts). The model sometimes puts a preset
+# from one table into another field (e.g. shutter "bronze_mirror"); the engine only accepts a
+# field's own presets, so such a value is swapped for that preset's colour.
+PRESET_HEX = {
+    "white_gloss": "#ffffff", "charcoal_matte": "#22272e", "warm_oak": "#b47846",
+    "emerald_green": "#0f4c3a", "royal_navy": "#142850", "cashmere_greige": "#d6cbbd",
+    "white_quartz": "#f1f5f9", "black_granite": "#111115", "concrete_grey": "#88929e",
+    "subway_tiles": "#e2e8f0", "white_marble": "#f8fafc", "bronze_mirror": "#3d3126",
+    "black": "#111111", "chrome": "#dddddd", "gold": "#d4af37",
+}
+FIELD_PRESETS = {"shutter": SHUTTERS, "countertop": COUNTERTOPS, "backsplash": BACKSPLASHES, "handle": HANDLES}
+
+
+def _fix_presets(values: Any, fields) -> None:
+    if not isinstance(values, dict):
+        return
+    for field in fields:
+        v = values.get(field)
+        if isinstance(v, str) and v in PRESET_HEX and v not in FIELD_PRESETS.get(field, ()):
+            values[field] = PRESET_HEX[v]
+
+
 def normalise_operations(raw_ops: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     ops = []
     for raw in raw_ops or []:
         if not isinstance(raw, dict) or raw.get("op") not in OPS:
             continue
         op = _clean(raw)
+        _fix_presets(op.get("finishes"), FIELD_PRESETS)
+        # Per-module colour is any colour, so wallPaint / floor / color presets become hex too.
+        _fix_presets(op.get("patch"), ("shutter", "handle", "color"))
+        _fix_presets(op.get("finishes"), ("wallPaint", "floor"))
         if op["op"] == "set_corner":
             op["walls"] = op.pop("corner", None) or ["A", "B"]
         else:
@@ -275,26 +305,21 @@ def normalise_operations(raw_ops: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return ops
 
 
-def _call_gemini(model: str, api_key: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+def _call_gemini(model: str, api_key: str, payload: Dict[str, Any], timeout: float) -> Dict[str, Any]:
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
     req = urllib.request.Request(
         url,
         data=json.dumps(payload).encode("utf-8"),
         headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
     )
-    with urllib.request.urlopen(req, timeout=float(os.getenv("GEMINI_TIMEOUT_SECONDS", "15"))) as res:
+    with urllib.request.urlopen(req, timeout=timeout) as res:
         data = json.loads(res.read().decode("utf-8"))
     text = data["candidates"][0]["content"]["parts"][0]["text"]
     return json.loads(text)
 
 
-def prompt_to_operations(prompt: str, plan: Dict[str, Any]) -> Dict[str, Any]:
-    api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key:
-        raise RuntimeError("GEMINI_API_KEY is not set on the server")
-
-    shape = str(plan.get("shape") or "L_SHAPE")
-    system = SYSTEM_PROMPT.format(
+def _system_prompt(shape: str) -> str:
+    return SYSTEM_PROMPT.format(
         directions=_direction_notes(shape),
         module_types=", ".join(MODULE_TYPES),
         floor_types="|".join(f'"{t}"' for t in FLOOR_TYPES),
@@ -303,11 +328,17 @@ def prompt_to_operations(prompt: str, plan: Dict[str, Any]) -> Dict[str, Any]:
         backsplashes=", ".join(BACKSPLASHES),
         handles=", ".join(HANDLES),
     )
-    user = f"CURRENT PLAN:\n{json.dumps(plan, separators=(',', ':'))}\n\nUSER REQUEST:\n{prompt}"
+
+
+def _generate(system: str, parts: List[Dict[str, Any]], timeout: float, models: List[str]) -> Dict[str, Any]:
+    """Runs the request through MODELS in order and returns the first usable answer."""
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        raise RuntimeError("GEMINI_API_KEY is not set on the server")
 
     base_payload = {
         "systemInstruction": {"parts": [{"text": system}]},
-        "contents": [{"role": "user", "parts": [{"text": user}]}],
+        "contents": [{"role": "user", "parts": parts}],
         "generationConfig": {"temperature": 0.1, "responseMimeType": "application/json"},
     }
     # Constrained decoding with RESPONSE_SCHEMA made the flash models drop optional booleans
@@ -319,10 +350,10 @@ def prompt_to_operations(prompt: str, plan: Dict[str, Any]) -> Dict[str, Any]:
         payloads.insert(0, with_schema)
 
     last_error = None
-    for model in MODELS:
+    for model in models:
         for payload in payloads:
             try:
-                result = _call_gemini(model, api_key, payload)
+                result = _call_gemini(model, api_key, payload, timeout)
                 if isinstance(result, list):  # model returned the operations array on its own
                     result = {"operations": result, "summary": ""}
                 return {
@@ -342,3 +373,85 @@ def prompt_to_operations(prompt: str, plan: Dict[str, Any]) -> Dict[str, Any]:
                 log.warning("Gemini %s", last_error)
                 break
     raise RuntimeError(f"All Gemini models failed. Last error: {last_error}")
+
+
+def prompt_to_operations(prompt: str, plan: Dict[str, Any]) -> Dict[str, Any]:
+    system = _system_prompt(str(plan.get("shape") or "L_SHAPE"))
+    user = f"CURRENT PLAN:\n{json.dumps(plan, separators=(',', ':'))}\n\nUSER REQUEST:\n{prompt}"
+    return _generate(system, [{"text": user}], float(os.getenv("GEMINI_TIMEOUT_SECONDS", "15")), MODELS)
+
+
+# --- Reference photo -> arrangement + finishes ----------------------------------------------------
+# The user has already fixed the shape, the wall lengths and every item with its size (the quotation).
+# A photo may only rearrange those modules and restyle them, so anything that adds, removes or
+# resizes is dropped here, whatever the model returns.
+IMAGE_OPS = {"move_module", "update_module", "update_modules", "set_finishes", "set_options", "add_opening", "update_opening"}
+SIZE_FIELDS = ("width", "height", "depth", "elevation")
+IMAGE_OPTIONS = ("countertop", "backsplash", "skirting", "ledLighting")
+
+IMAGE_PROMPT = """
+
+REFERENCE PHOTO MODE:
+The user attached a photo of a kitchen they like. Recreate its LOOK and ARRANGEMENT on CURRENT PLAN.
+The shape, the wall lengths and every module with its width are the customer's quotation and are FIXED:
+- NEVER add, remove, replace, duplicate or resize modules, never use auto_design / set_room / set_corner /
+  add_floor_item, and never put width / height / depth / elevation in a patch.
+- Allowed: move_module (put the existing sink, hob, pantry, drawers, appliances in the same order and
+  on the same walls as the photo), update_module / update_modules (shutter colour, handle, doors,
+  drawers, hinge), set_finishes (shutters, countertop, backsplash, handles, wallPaint, floor),
+  set_options (countertop, backsplash, skirting, ledLighting) and add_opening for windows / gas
+  points clearly visible in the photo when the plan has none on that wall: one add_opening per
+  window you see (two windows -> two ops, spread along the wall, e.g. offsets near 1/4 and 3/4).
+- Map the photo to walls: STRAIGHT -> the one run is A. L_SHAPE -> the run on the left of the photo is A,
+  the back run is B (if only two runs are visible, the longer back run is B). U_SHAPE -> left A, back B,
+  right C. PARALLEL -> the run the photo faces is A, the opposite one B. If the photo shows fewer walls
+  than the plan, arrange what is visible and leave the rest.
+- If the photo has items the plan does not have, ignore them and mention them in the summary as
+  suggestions ("photo mein tall unit bhi hai"). If the plan has items the photo does not show, keep them.
+- Colours: measure each colour from the photo itself and write it as "#rrggbb". Do NOT reuse the example
+  codes from the COLOURS list above (e.g. a sage / muted green is NOT "#708238"; pick the shade you see,
+  allowing for sunlight and shadow). Use a preset name only when it clearly matches, e.g. a wooden oak
+  look -> warm_oak, black granite -> black_granite.
+- Cabinet rows are separate zones and each gets its own colour when the photo differs:
+  zone "base" = below the counter, zone "wall" = the upper cabinets above the backsplash,
+  zone "loft" = a second, higher row up to the ceiling. If the photo shows two rows of upper cabinets,
+  the top row is the loft. Use set_finishes.shutter for the most common colour, then update_modules with
+  filter zone for the rows that differ. Glass or mirror shutters: use the glass colour (e.g. tinted black
+  glass -> a near-black "#rrggbb"). Handleless / profile (gola) handles: use handle "black" when the
+  profile is dark, "chrome" when it is steel.
+- Move each module at most once, with an explicit offset that keeps it inside its wall. Order the
+  moves from the corner end outwards.
+- If the photo is not a kitchen, return no operations and say so in the summary.
+"""
+
+
+def _image_safe(ops: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    out = []
+    for op in ops:
+        if op["op"] not in IMAGE_OPS:
+            continue
+        if isinstance(op.get("patch"), dict):
+            for k in SIZE_FIELDS:
+                op["patch"].pop(k, None)
+            if not op["patch"]:
+                continue
+        if op["op"] == "set_options":
+            op["options"] = {k: v for k, v in (op.get("options") or {}).items() if k in IMAGE_OPTIONS}
+            if not op["options"]:
+                continue
+        if op["op"] == "add_opening" and op.get("kind") == "door":
+            continue
+        out.append(op)
+    return out
+
+
+def image_to_operations(image_b64: str, mime_type: str, note: str, plan: Dict[str, Any]) -> Dict[str, Any]:
+    system = _system_prompt(str(plan.get("shape") or "L_SHAPE")) + IMAGE_PROMPT
+    user = (
+        f"CURRENT PLAN:\n{json.dumps(plan, separators=(',', ':'))}\n\n"
+        f"USER REQUEST:\n{note or 'Make my kitchen look and be arranged like this photo.'}"
+    )
+    parts = [{"inline_data": {"mime_type": mime_type, "data": image_b64}}, {"text": user}]
+    result = _generate(system, parts, float(os.getenv("GEMINI_IMAGE_TIMEOUT_SECONDS", "40")), IMAGE_MODELS)
+    result["operations"] = _image_safe(result["operations"])
+    return result

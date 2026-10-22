@@ -14,7 +14,7 @@ from pydantic import BaseModel, Field
 
 load_dotenv()
 
-from kitchen_ai import prompt_to_operations  # noqa: E402  (needs env loaded first)
+from kitchen_ai import image_to_operations, prompt_to_operations  # noqa: E402  (needs env loaded first)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("decormatrix")
@@ -100,6 +100,17 @@ class KitchenAiRequest(BaseModel):
     plan: Dict[str, Any]
 
 
+IMAGE_TYPES = {"image/jpeg", "image/png", "image/webp", "image/heic", "image/heif"}
+MAX_IMAGE_BASE64 = 8_000_000  # ~6 MB photo
+
+
+class KitchenImageRequest(BaseModel):
+    image: str = Field(..., min_length=100, max_length=MAX_IMAGE_BASE64)
+    mimeType: str = "image/jpeg"
+    prompt: str = Field("", max_length=1000)
+    plan: Dict[str, Any]
+
+
 class KitchenAiResponse(BaseModel):
     operations: list
     summary: str
@@ -155,6 +166,27 @@ def kitchen_ai(req: KitchenAiRequest, request: Request, authorization: Optional[
         log.exception("AI request failed")
         raise HTTPException(status_code=502, detail=f"AI designer is unavailable: {e}")
     log.info("user=%s model=%s ops=%d", user_id, result.get("model"), len(result["operations"]))
+    return {"operations": result["operations"], "summary": result["summary"]}
+
+
+@app.post("/api/kitchen/ai/image", response_model=KitchenAiResponse)
+def kitchen_ai_image(req: KitchenImageRequest, request: Request, authorization: Optional[str] = Header(default=None)):
+    """Reference photo -> arrangement and finishes for the modules already in the plan."""
+    user_id = _user_from_token(authorization)
+    _check_rate(user_id if AUTH_ENABLED else (request.client.host if request.client else "anon"))
+
+    mime = req.mimeType.lower()
+    if mime not in IMAGE_TYPES:
+        raise HTTPException(status_code=415, detail="Use a JPEG, PNG or WebP photo")
+    if len(json.dumps(req.plan)) > 60_000:
+        raise HTTPException(status_code=413, detail="Kitchen plan is too large")
+    image = req.image.split(",", 1)[1] if req.image.startswith("data:") else req.image
+    try:
+        result = image_to_operations(image, mime, req.prompt.strip(), req.plan)
+    except Exception as e:
+        log.exception("AI image request failed")
+        raise HTTPException(status_code=502, detail=f"AI designer is unavailable: {e}")
+    log.info("user=%s model=%s image ops=%d", user_id, result.get("model"), len(result["operations"]))
     return {"operations": result["operations"], "summary": result["summary"]}
 
 
